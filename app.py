@@ -2,6 +2,7 @@ import io
 import json
 import os
 import re
+import tempfile
 from datetime import datetime
 from difflib import SequenceMatcher
 
@@ -10,10 +11,17 @@ import pandas as pd
 import pdfplumber
 import streamlit as st
 from docx import Document
+from openpyxl.drawing.image import Image as XLImage
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
-# Optional dependencies (graceful fallback if user hasn't installed yet)
+# Optional dependencies (graceful fallback)
+try:
+    from PIL import Image as PILImage
+    HAS_PIL = True
+except ImportError:
+    HAS_PIL = False
+
 try:
     import fpdf
     from fpdf import FPDF
@@ -45,6 +53,7 @@ INITIAL_SEED_FILE = "final_table_checked.csv"
 ALIAS_FILE = "alias_memory.csv"
 HISTORY_FILE = "quotation_history.json"
 CLOUD_CFG_FILE = "gsheet_config.json"
+LOGO_FILE = "company_logo.png"
 
 MASTER_COLS = ["main_material", "sub_material", "purchase_price", "discount"]
 ALIAS_COLS = ["bom_strict_key", "bom_sample_name", "master_strict_key", "master_sub_material", "created_at"]
@@ -138,6 +147,55 @@ st.markdown(
 
 
 # ============================================================
+# COMPANY LOGO UTILITIES (UPLOAD, NORMALIZE, SAVE & LOAD)
+# ============================================================
+def normalize_logo_png(raw_bytes: bytes, max_w: int = 380, max_h: int = 120) -> bytes:
+    if not HAS_PIL:
+        return raw_bytes
+    im = PILImage.open(io.BytesIO(raw_bytes))
+    if im.mode not in ("RGB", "RGBA"):
+        im = im.convert("RGBA")
+    im.thumbnail((max_w, max_h), PILImage.LANCZOS)
+    out = io.BytesIO()
+    im.save(out, format="PNG")
+    return out.getvalue()
+
+
+def save_logo_bytes(raw_bytes: bytes) -> bytes:
+    norm = normalize_logo_png(raw_bytes)
+    try:
+        with open(LOGO_FILE, "wb") as f:
+            f.write(norm)
+    except Exception:
+        pass
+    st.session_state["company_logo_bytes"] = norm
+    return norm
+
+
+def load_logo_bytes():
+    if st.session_state.get("company_logo_bytes"):
+        return st.session_state["company_logo_bytes"]
+    if os.path.exists(LOGO_FILE):
+        try:
+            with open(LOGO_FILE, "rb") as f:
+                data = f.read()
+            st.session_state["company_logo_bytes"] = data
+            return data
+        except Exception:
+            return None
+    return None
+
+
+def clear_logo():
+    st.session_state["company_logo_bytes"] = None
+    if os.path.exists(LOGO_FILE):
+        try:
+            os.remove(LOGO_FILE)
+        except Exception:
+            pass
+
+
+# ============================================================
 # STRICT KEY & MATCHING UTILITIES
 # ============================================================
 def strict_alnum_key(text: str) -> str:
@@ -207,8 +265,16 @@ def get_top_close_matches(bom_sub: str, bom_main: str, master_df: pd.DataFrame, 
 
 
 # ============================================================
-# LOCAL + OPTIONAL GOOGLE SHEETS CLOUD STORAGE LAYER
+# LOCAL + OPTIONAL GOOGLE SHEETS CLOUD STORAGE & TOML GENERATOR
 # ============================================================
+def generate_streamlit_toml(gsheet_url: str, sa_dict: dict) -> str:
+    """Converts Google Sheet URL + Service Account JSON into valid copy-paste Streamlit Secrets TOML."""
+    lines = [f"gsheet_url = {json.dumps(str(gsheet_url).strip())}", "", "[gcp_service_account]"]
+    for k, v in sa_dict.items():
+        lines.append(f"{k} = {json.dumps(v)}")
+    return "\n".join(lines)
+
+
 def load_cloud_config() -> dict:
     try:
         if "gcp_service_account" in st.secrets and "gsheet_url" in st.secrets:
@@ -316,6 +382,27 @@ def pull_history_from_gsheet(cfg: dict) -> list:
             except Exception:
                 continue
     return history
+
+
+def bootstrap_from_cloud_once():
+    """On Streamlit Cloud cold start, auto-pull live data from Google Sheets once per session."""
+    if st.session_state.get("_cloud_bootstrapped"):
+        return
+    cfg = load_cloud_config()
+    if cfg.get("source") == "streamlit_secrets" and HAS_GSPREAD:
+        try:
+            m_cloud = pull_df_from_gsheet("Mastersheet", MASTER_COLS, cfg)
+            if not m_cloud.empty:
+                save_mastersheet(m_cloud, sync_cloud=False)
+            a_cloud = pull_df_from_gsheet("Alias_Memory", ALIAS_COLS, cfg)
+            if not a_cloud.empty:
+                save_aliases(a_cloud, sync_cloud=False)
+            h_cloud = pull_history_from_gsheet(cfg)
+            if h_cloud:
+                save_history(h_cloud, sync_cloud=False)
+        except Exception:
+            pass
+    st.session_state["_cloud_bootstrapped"] = True
 
 
 # ============================================================
@@ -727,6 +814,124 @@ def compute_commercials(items_df: pd.DataFrame, profit_pct: float, pf_pct: float
 
 
 # ============================================================
+# REVISION COMPARISON ENGINE (REV A vs REV B)
+# ============================================================
+def compare_revisions(rev_a: dict, rev_b: dict):
+    df_a, sum_a = compute_commercials(
+        pd.DataFrame(rev_a.get("items", [])),
+        float(rev_a.get("profit_pct", 12.0)),
+        float(rev_a.get("pf_pct", 0.0)),
+        float(rev_a.get("gst_pct", 18.0)),
+    )
+    df_b, sum_b = compute_commercials(
+        pd.DataFrame(rev_b.get("items", [])),
+        float(rev_b.get("profit_pct", 12.0)),
+        float(rev_b.get("pf_pct", 0.0)),
+        float(rev_b.get("gst_pct", 18.0)),
+    )
+
+    df_a["_k"] = df_a["sub_material"].apply(strict_alnum_key)
+    df_b["_k"] = df_b["sub_material"].apply(strict_alnum_key)
+
+    map_a = df_a.drop_duplicates("_k").set_index("_k").to_dict(orient="index")
+    map_b = df_b.drop_duplicates("_k").set_index("_k").to_dict(orient="index")
+
+    ordered_keys = list(dict.fromkeys(df_a["_k"].tolist() + df_b["_k"].tolist()))
+    rows = []
+    counts = {"Added": 0, "Removed": 0, "Modified": 0, "Unchanged": 0}
+
+    for k in ordered_keys:
+        a = map_a.get(k)
+        b = map_b.get(k)
+        if a and not b:
+            counts["Removed"] += 1
+            rows.append(
+                {
+                    "Status": "Removed",
+                    "Main Material": a["main_material"],
+                    "Sub Material": a["sub_material"],
+                    "Old QTY": float(a["qty"]),
+                    "New QTY": 0.0,
+                    "Old Net Rate": round(float(a["Net Unit Rate"]), 2),
+                    "New Net Rate": 0.0,
+                    "Old Total": round(float(a["Total Amnt"]), 2),
+                    "New Total": 0.0,
+                    "Delta (INR)": round(-float(a["Total Amnt"]), 2),
+                    "Change Notes": "Item removed in revised quote",
+                }
+            )
+        elif b and not a:
+            counts["Added"] += 1
+            rows.append(
+                {
+                    "Status": "Added",
+                    "Main Material": b["main_material"],
+                    "Sub Material": b["sub_material"],
+                    "Old QTY": 0.0,
+                    "New QTY": float(b["qty"]),
+                    "Old Net Rate": 0.0,
+                    "New Net Rate": round(float(b["Net Unit Rate"]), 2),
+                    "Old Total": 0.0,
+                    "New Total": round(float(b["Total Amnt"]), 2),
+                    "Delta (INR)": round(float(b["Total Amnt"]), 2),
+                    "Change Notes": "New item added",
+                }
+            )
+        else:
+            qty_diff = abs(float(b["qty"]) - float(a["qty"])) > 1e-6
+            rate_diff = abs(float(b["Net Unit Rate"]) - float(a["Net Unit Rate"])) > 1e-4
+            disc_diff = abs(float(b["discount"]) - float(a["discount"])) > 1e-4
+            notes = []
+            if qty_diff:
+                notes.append(f"QTY {a['qty']:g}->{b['qty']:g}")
+            if rate_diff:
+                notes.append(f"Rate Rs.{a['Net Unit Rate']:,.2f}->Rs.{b['Net Unit Rate']:,.2f}")
+            if disc_diff:
+                notes.append(f"Disc {a['discount']:g}%->{b['discount']:g}%")
+
+            status = "Modified" if notes else "Unchanged"
+            counts[status] += 1
+            delta = float(b["Total Amnt"]) - float(a["Total Amnt"])
+            rows.append(
+                {
+                    "Status": status,
+                    "Main Material": b["main_material"],
+                    "Sub Material": b["sub_material"],
+                    "Old QTY": float(a["qty"]),
+                    "New QTY": float(b["qty"]),
+                    "Old Net Rate": round(float(a["Net Unit Rate"]), 2),
+                    "New Net Rate": round(float(b["Net Unit Rate"]), 2),
+                    "Old Total": round(float(a["Total Amnt"]), 2),
+                    "New Total": round(float(b["Total Amnt"]), 2),
+                    "Delta (INR)": round(delta, 2),
+                    "Change Notes": "; ".join(notes) if notes else "No change",
+                }
+            )
+
+    diff_df = pd.DataFrame(rows)
+    basic_delta = sum_b["basic_total"] - sum_a["basic_total"]
+    grand_delta = sum_b["grand_total_incl_gst"] - sum_a["grand_total_incl_gst"]
+    pct_delta = (grand_delta / sum_a["grand_total_incl_gst"] * 100.0) if sum_a["grand_total_incl_gst"] > 0 else 0.0
+
+    comp_meta = {
+        "label_a": f"Annexure {rev_a['annexure_no']} (Rev {rev_a['revision']})",
+        "label_b": f"Annexure {rev_b['annexure_no']} (Rev {rev_b['revision']})",
+        "date_a": rev_a.get("created_at", ""),
+        "date_b": rev_b.get("created_at", ""),
+        "customer": rev_b.get("customer") or rev_a.get("customer", ""),
+        "project": rev_b.get("project") or rev_a.get("project", ""),
+        "company_name": rev_b.get("company_name") or rev_a.get("company_name", "Quotation Comparison"),
+        "sum_a": sum_a,
+        "sum_b": sum_b,
+        "basic_delta": basic_delta,
+        "grand_delta": grand_delta,
+        "pct_delta": pct_delta,
+        "counts": counts,
+    }
+    return diff_df, comp_meta
+
+
+# ============================================================
 # EXPORT 1: INTERNAL COSTING EXCEL (EXACT quotation 6500389 FORMAT)
 # ============================================================
 def build_internal_quotation_excel(
@@ -869,7 +1074,6 @@ def build_internal_quotation_excel(
     ws.page_setup.fitToHeight = 0
     ws.sheet_properties.pageSetUpPr.fitToPage = True
 
-    # Sheet 2: Commercial & Profitability Summary
     ws_sum = wb.create_sheet("Commercial_Summary")
     ws_sum.cell(row=1, column=1, value=f"{meta.get('company_name', 'QUOTATION')} — INTERNAL COMMERCIAL SUMMARY").font = font_title
     meta_rows = [
@@ -928,7 +1132,6 @@ def build_internal_quotation_excel(
     ws_sum.column_dimensions["A"].width = 38
     ws_sum.column_dimensions["B"].width = 48
 
-    # Sheet 3: Match Audit
     if audit_df is not None and not audit_df.empty:
         ws2 = wb.create_sheet("Match_Audit")
         for c_idx, col_name in enumerate(audit_df.columns, start=1):
@@ -952,19 +1155,20 @@ def build_internal_quotation_excel(
 
 
 # ============================================================
-# EXPORT 2: CUSTOMER-FACING EXCEL (NO PURCHASE / PROFIT COLUMNS)
+# EXPORT 2: CUSTOMER-FACING EXCEL (WITH LOGO & NO COSTING)
 # ============================================================
 def build_customer_quotation_excel(
     final_df: pd.DataFrame,
     meta: dict,
     summary: dict,
     default_make: str,
+    logo_bytes: bytes = None,
 ) -> io.BytesIO:
     wb = openpyxl.Workbook()
     ws_cov = wb.active
     ws_cov.title = "Quotation_Cover"
 
-    font_company = Font(name="Calibri", size=16, bold=True, color="FFFFFF")
+    font_company = Font(name="Calibri", size=15, bold=True, color="FFFFFF")
     font_sub = Font(name="Calibri", size=11, bold=True, color="1F4E78")
     font_hdr = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
     font_cat = Font(name="Calibri", size=11, bold=True, color="000000")
@@ -981,12 +1185,32 @@ def build_customer_quotation_excel(
     border_cell = Border(left=thin, right=thin, top=thin, bottom=thin)
     border_total = Border(top=med, bottom=med, left=thin, right=thin)
 
-    ws_cov.merge_cells("A1:D1")
-    c_banner = ws_cov.cell(row=1, column=1, value=f"{meta.get('company_name', 'SUNDRY ITEMS QUOTATION').upper()} — COMMERCIAL OFFER")
-    c_banner.font = font_company
-    c_banner.fill = fill_hdr
-    c_banner.alignment = Alignment(horizontal="center", vertical="center")
-    ws_cov.row_dimensions[1].height = 34
+    logo_added = False
+    if logo_bytes and HAS_PIL:
+        try:
+            pil_im = PILImage.open(io.BytesIO(logo_bytes))
+            aspect = pil_im.width / float(pil_im.height or 1)
+            xl_img = XLImage(io.BytesIO(logo_bytes))
+            xl_img.height = 54
+            xl_img.width = min(210, int(54 * aspect))
+            ws_cov.add_image(xl_img, "A1")
+            ws_cov.row_dimensions[1].height = 48
+            ws_cov.merge_cells("B1:D1")
+            c_banner = ws_cov.cell(row=1, column=2, value=f"{meta.get('company_name', 'SUNDRY ITEMS QUOTATION').upper()} — COMMERCIAL OFFER")
+            c_banner.font = font_company
+            c_banner.fill = fill_hdr
+            c_banner.alignment = Alignment(horizontal="center", vertical="center")
+            logo_added = True
+        except Exception:
+            logo_added = False
+
+    if not logo_added:
+        ws_cov.merge_cells("A1:D1")
+        c_banner = ws_cov.cell(row=1, column=1, value=f"{meta.get('company_name', 'SUNDRY ITEMS QUOTATION').upper()} — COMMERCIAL OFFER")
+        c_banner.font = font_company
+        c_banner.fill = fill_hdr
+        c_banner.alignment = Alignment(horizontal="center", vertical="center")
+        ws_cov.row_dimensions[1].height = 36
 
     details = [
         ("Quotation / Ref No:", f"QTN-{meta['annexure_no']}-Rev{meta['revision']}", "Date:", meta["quote_date"]),
@@ -1003,7 +1227,6 @@ def build_customer_quotation_excel(
             if c_i in (1, 3):
                 ws_cov.cell(row=idx, column=c_i).fill = fill_light
 
-    # Sheet 2: Clean Price Schedule (No Purchase, No Profit!)
     ws_ps = wb.create_sheet("Price_Schedule")
     ws_ps.merge_cells("A1:G1")
     c_ps_t = ws_ps.cell(row=1, column=1, value=f"PRICE SCHEDULE — ANNEXURE {meta['annexure_no']} (Rev {meta['revision']})")
@@ -1081,7 +1304,6 @@ def build_customer_quotation_excel(
     ws_ps.page_setup.fitToHeight = 0
     ws_ps.sheet_properties.pageSetUpPr.fitToPage = True
 
-    # Populate Commercial Summary on Cover Sheet
     r_c = 8
     ws_cov.merge_cells(start_row=r_c, start_column=1, end_row=r_c, end_column=3)
     ws_cov.cell(row=r_c, column=1, value="COMMERCIAL SUMMARY").font = font_hdr
@@ -1120,7 +1342,7 @@ def build_customer_quotation_excel(
             ws_cov.merge_cells(start_row=r_t, start_column=1, end_row=r_t, end_column=4)
             ws_cov.cell(row=r_t, column=1, value=line.strip()).font = font_data
 
-    for col_i, w in {1: 22, 2: 40, 3: 18, 4: 24}.items():
+    for col_i, w in {1: 28, 2: 38, 3: 18, 4: 24}.items():
         ws_cov.column_dimensions[get_column_letter(col_i)].width = w
     ws_cov.page_setup.fitToWidth = 1
     ws_cov.page_setup.fitToHeight = 1
@@ -1133,25 +1355,50 @@ def build_customer_quotation_excel(
 
 
 # ============================================================
-# EXPORT 3: CUSTOMER-FACING PDF (CLEAN COMMERCIAL OFFER)
+# EXPORT 3: CUSTOMER-FACING PDF (WITH COMPANY LOGO)
 # ============================================================
 def safe_pdf_text(text: str) -> str:
     return str(text).replace("₹", "Rs.").encode("latin-1", "replace").decode("latin-1")
 
 
-def build_customer_pdf(final_df: pd.DataFrame, meta: dict, summary: dict, default_make: str) -> io.BytesIO:
+def _pdf_add_logo_header(pdf: FPDF, title_text: str, logo_bytes: bytes = None):
+    if logo_bytes:
+        tmp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tf:
+                tf.write(logo_bytes)
+                tmp_path = tf.name
+            pdf.image(tmp_path, x=10, y=10, h=14)
+            pdf.set_xy(54, 10)
+            pdf.set_fill_color(31, 78, 120)
+            pdf.set_text_color(255, 255, 255)
+            pdf.set_font("Helvetica", "B", 12)
+            pdf.cell(0, 14, safe_pdf_text(title_text), ln=1, align="C", fill=True)
+            pdf.ln(3)
+            return
+        except Exception:
+            pass
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
+
+    pdf.set_fill_color(31, 78, 120)
+    pdf.set_text_color(255, 255, 255)
+    pdf.set_font("Helvetica", "B", 13)
+    pdf.cell(0, 12, safe_pdf_text(title_text), ln=1, align="C", fill=True)
+    pdf.ln(3)
+
+
+def build_customer_pdf(final_df: pd.DataFrame, meta: dict, summary: dict, default_make: str, logo_bytes: bytes = None) -> io.BytesIO:
     pdf = FPDF(orientation="P", unit="mm", format="A4")
     pdf.set_auto_page_break(auto=True, margin=14)
     pdf.add_page()
 
-    # Header Banner
-    pdf.set_fill_color(31, 78, 120)
-    pdf.set_text_color(255, 255, 255)
-    pdf.set_font("Helvetica", "B", 13)
-    pdf.cell(0, 12, safe_pdf_text(f"{meta.get('company_name', 'COMMERCIAL QUOTATION')} - QUOTATION"), ln=1, align="C", fill=True)
-    pdf.ln(3)
+    _pdf_add_logo_header(pdf, f"{meta.get('company_name', 'COMMERCIAL QUOTATION')} - QUOTATION", logo_bytes=logo_bytes)
 
-    # Project Metadata Grid
     pdf.set_text_color(0, 0, 0)
     pdf.set_font("Helvetica", "B", 9)
     pdf.cell(32, 6, "Quotation Ref:", border=1)
@@ -1177,7 +1424,6 @@ def build_customer_pdf(final_df: pd.DataFrame, meta: dict, summary: dict, defaul
     pdf.cell(0, 6, safe_pdf_text(meta.get("project", "-")[:95]), border=1, ln=1)
     pdf.ln(4)
 
-    # Table Header
     widths = [10, 86, 18, 14, 20, 14, 28]
     headers = ["Sr", "Material Description", "Make", "QTY", "Rate (Rs)", "Disc%", "Total (Rs)"]
     pdf.set_fill_color(31, 78, 120)
@@ -1187,7 +1433,6 @@ def build_customer_pdf(final_df: pd.DataFrame, meta: dict, summary: dict, defaul
         pdf.cell(w, 7, h, border=1, align="C", fill=True)
     pdf.ln()
 
-    # Rows grouped by Main Material
     pdf.set_text_color(0, 0, 0)
     for cat_name, grp in final_df.groupby("main_material", sort=False):
         pdf.set_fill_color(217, 225, 242)
@@ -1208,7 +1453,6 @@ def build_customer_pdf(final_df: pd.DataFrame, meta: dict, summary: dict, defaul
             pdf.cell(widths[6], 6, f"{item['Total Amnt']:,.2f}", border=1, align="R")
             pdf.ln()
 
-    # Commercial Summary Box
     pdf.ln(3)
     sum_rows = [
         ("Basic Material Total", f"Rs. {summary['basic_total']:,.2f}", False),
@@ -1224,7 +1468,6 @@ def build_customer_pdf(final_df: pd.DataFrame, meta: dict, summary: dict, defaul
         pdf.cell(130, 6.5, safe_pdf_text(lbl), border=1, align="R", fill=(idx_s == 4))
         pdf.cell(60, 6.5, safe_pdf_text(val), border=1, align="R", fill=(idx_s == 4), ln=1)
 
-    # Terms
     pdf.ln(4)
     pdf.set_font("Helvetica", "B", 9)
     pdf.cell(0, 6, "Terms & Conditions:", ln=1)
@@ -1241,12 +1484,190 @@ def build_customer_pdf(final_df: pd.DataFrame, meta: dict, summary: dict, defaul
 
 
 # ============================================================
-# MAIN HEADER & DATA LOAD
+# EXPORT 4 & 5: REVISION COMPARISON EXCEL & PDF (REV A vs REV B)
 # ============================================================
+def build_comparison_excel(diff_df: pd.DataFrame, comp_meta: dict) -> io.BytesIO:
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Revision_Comparison"
+
+    font_title = Font(name="Calibri", size=14, bold=True, color="FFFFFF")
+    font_hdr = Font(name="Calibri", size=10, bold=True, color="FFFFFF")
+    font_bold = Font(name="Calibri", size=10, bold=True, color="000000")
+    font_data = Font(name="Calibri", size=10, color="000000")
+
+    fill_hdr = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
+    fill_add = PatternFill(start_color="E2EFDA", end_color="E2EFDA", fill_type="solid")
+    fill_rem = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+    fill_mod = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
+
+    thin = Side(style="thin", color="BFBFBF")
+    border_cell = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    ws.merge_cells("A1:K1")
+    c_t = ws.cell(row=1, column=1, value=f"QUOTATION REVISION COMPARISON: {comp_meta['label_a']}  vs  {comp_meta['label_b']}")
+    c_t.font = font_title
+    c_t.fill = fill_hdr
+    c_t.alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[1].height = 28
+
+    sum_rows = [
+        ("Customer", comp_meta["customer"], "Baseline Basic Total (INR)", comp_meta["sum_a"]["basic_total"]),
+        ("Project", comp_meta["project"], "Revised Basic Total (INR)", comp_meta["sum_b"]["basic_total"]),
+        ("Baseline Date", comp_meta["date_a"], "Baseline Grand Total Incl. GST", comp_meta["sum_a"]["grand_total_incl_gst"]),
+        ("Revised Date", comp_meta["date_b"], "Revised Grand Total Incl. GST", comp_meta["sum_b"]["grand_total_incl_gst"]),
+        (
+            "Changes Summary",
+            f"Added: {comp_meta['counts']['Added']} | Removed: {comp_meta['counts']['Removed']} | Modified: {comp_meta['counts']['Modified']}",
+            "Net Variance (INR / %)",
+            f"Rs. {comp_meta['grand_delta']:+,.2f} ({comp_meta['pct_delta']:+.1f}%)",
+        ),
+    ]
+    for r_i, (k1, v1, k2, v2) in enumerate(sum_rows, start=3):
+        ws.cell(row=r_i, column=1, value=k1).font = font_bold
+        ws.merge_cells(start_row=r_i, start_column=2, end_row=r_i, end_column=6)
+        ws.cell(row=r_i, column=2, value=v1).font = font_data
+        ws.merge_cells(start_row=r_i, start_column=7, end_row=r_i, end_column=9)
+        ws.cell(row=r_i, column=7, value=k2).font = font_bold
+        ws.merge_cells(start_row=r_i, start_column=10, end_row=r_i, end_column=11)
+        c_v2 = ws.cell(row=r_i, column=10, value=v2)
+        c_v2.font = font_bold
+        if isinstance(v2, (int, float)):
+            c_v2.number_format = "#,##0.00"
+            c_v2.alignment = Alignment(horizontal="right")
+
+    hdr_row = 9
+    cols = list(diff_df.columns)
+    for c_i, col_name in enumerate(cols, start=1):
+        c = ws.cell(row=hdr_row, column=c_i, value=col_name)
+        c.font = font_hdr
+        c.fill = fill_hdr
+        c.alignment = Alignment(horizontal="center", vertical="center")
+        c.border = border_cell
+    ws.row_dimensions[hdr_row].height = 24
+
+    for idx, (_, row) in enumerate(diff_df.iterrows(), start=hdr_row + 1):
+        st_val = row["Status"]
+        row_fill = fill_add if st_val == "Added" else (fill_rem if st_val == "Removed" else (fill_mod if st_val == "Modified" else None))
+        for c_i, col_name in enumerate(cols, start=1):
+            val = row[col_name]
+            cell = ws.cell(row=idx, column=c_i, value=val)
+            cell.font = font_bold if col_name in ("Status", "Delta (INR)") else font_data
+            cell.border = border_cell
+            if row_fill is not None:
+                cell.fill = row_fill
+            if col_name in ("Old Net Rate", "New Net Rate", "Old Total", "New Total", "Delta (INR)"):
+                cell.number_format = "#,##0.00"
+                cell.alignment = Alignment(horizontal="right", vertical="center")
+            elif col_name in ("Old QTY", "New QTY"):
+                cell.number_format = "#,##0.##"
+                cell.alignment = Alignment(horizontal="right", vertical="center")
+            elif col_name == "Status":
+                cell.alignment = Alignment(horizontal="center", vertical="center")
+            else:
+                cell.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+
+    widths = {1: 12, 2: 26, 3: 46, 4: 10, 5: 10, 6: 13, 7: 13, 8: 14, 9: 14, 10: 14, 11: 32}
+    for c_i, w in widths.items():
+        ws.column_dimensions[get_column_letter(c_i)].width = w
+    ws.freeze_panes = "A10"
+    ws.page_setup.orientation = ws.ORIENTATION_LANDSCAPE
+    ws.page_setup.fitToWidth = 1
+    ws.page_setup.fitToHeight = 0
+    ws.sheet_properties.pageSetUpPr.fitToPage = True
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf
+
+
+def build_comparison_pdf(diff_df: pd.DataFrame, comp_meta: dict, logo_bytes: bytes = None) -> io.BytesIO:
+    pdf = FPDF(orientation="L", unit="mm", format="A4")
+    pdf.set_auto_page_break(auto=True, margin=12)
+    pdf.add_page()
+
+    _pdf_add_logo_header(
+        pdf,
+        f"REVISION COMPARISON: {comp_meta['label_a']} vs {comp_meta['label_b']}",
+        logo_bytes=logo_bytes,
+    )
+
+    pdf.set_text_color(0, 0, 0)
+    pdf.set_font("Helvetica", "B", 8.5)
+    pdf.cell(135, 6, safe_pdf_text(f"Customer: {comp_meta['customer']} | Project: {comp_meta['project'][:50]}"), border=1)
+    pdf.cell(
+        0,
+        6,
+        safe_pdf_text(
+            f"Grand Total Delta: Rs. {comp_meta['grand_delta']:+,.2f} ({comp_meta['pct_delta']:+.1f}%) | "
+            f"+{comp_meta['counts']['Added']} Add / -{comp_meta['counts']['Removed']} Rem / {comp_meta['counts']['Modified']} Mod"
+        ),
+        border=1,
+        ln=1,
+    )
+    pdf.ln(3)
+
+    widths = [18, 92, 16, 16, 24, 24, 24, 24, 39]
+    headers = ["Status", "Sub Material", "Old Q", "New Q", "Old Rate", "New Rate", "Old Total", "New Total", "Delta / Notes"]
+    pdf.set_fill_color(31, 78, 120)
+    pdf.set_text_color(255, 255, 255)
+    pdf.set_font("Helvetica", "B", 7.5)
+    for w, h in zip(widths, headers):
+        pdf.cell(w, 7, h, border=1, align="C", fill=True)
+    pdf.ln()
+
+    pdf.set_text_color(0, 0, 0)
+    pdf.set_font("Helvetica", "", 7)
+    for _, r in diff_df.iterrows():
+        st_val = r["Status"]
+        if st_val == "Added":
+            pdf.set_fill_color(226, 239, 218)
+            fill = True
+        elif st_val == "Removed":
+            pdf.set_fill_color(255, 199, 206)
+            fill = True
+        elif st_val == "Modified":
+            pdf.set_fill_color(255, 242, 204)
+            fill = True
+        else:
+            fill = False
+
+        desc = safe_pdf_text(r["Sub Material"])
+        if len(desc) > 60:
+            desc = desc[:57] + "..."
+        note = safe_pdf_text(f"{r['Delta (INR)']:+,.0f} | {r['Change Notes']}")
+        if len(note) > 28:
+            note = note[:25] + "..."
+
+        pdf.cell(widths[0], 5.5, st_val, border=1, align="C", fill=fill)
+        pdf.cell(widths[1], 5.5, desc, border=1, align="L", fill=fill)
+        pdf.cell(widths[2], 5.5, f"{r['Old QTY']:g}", border=1, align="R", fill=fill)
+        pdf.cell(widths[3], 5.5, f"{r['New QTY']:g}", border=1, align="R", fill=fill)
+        pdf.cell(widths[4], 5.5, f"{r['Old Net Rate']:,.2f}", border=1, align="R", fill=fill)
+        pdf.cell(widths[5], 5.5, f"{r['New Net Rate']:,.2f}", border=1, align="R", fill=fill)
+        pdf.cell(widths[6], 5.5, f"{r['Old Total']:,.2f}", border=1, align="R", fill=fill)
+        pdf.cell(widths[7], 5.5, f"{r['New Total']:,.2f}", border=1, align="R", fill=fill)
+        pdf.cell(widths[8], 5.5, note, border=1, align="L", fill=fill)
+        pdf.ln()
+
+    raw_pdf = pdf.output() if IS_FPDF2 else pdf.output(dest="S")
+    pdf_bytes = raw_pdf.encode("latin-1") if isinstance(raw_pdf, str) else bytes(raw_pdf)
+    buf = io.BytesIO(pdf_bytes)
+    buf.seek(0)
+    return buf
+
+
+# ============================================================
+# MAIN BOOTSTRAP & HEADER
+# ============================================================
+bootstrap_from_cloud_once()
+
 master_df = load_mastersheet()
 alias_df = load_aliases()
 history_list = load_history()
 cloud_cfg = load_cloud_config()
+logo_bytes = load_logo_bytes()
 
 cloud_badge = "☁️ Google Sheets Auto-Sync ON" if (cloud_cfg.get("enabled") and cloud_cfg.get("auto_sync")) else "💻 Local Offline Mode"
 
@@ -1254,7 +1675,7 @@ st.markdown(
     f"""
     <div class="main-header">
         <h1>📊 SundryQuote Pro — Enterprise BOM Quotation System</h1>
-        <p>Auto-Learning Alias Memory • Margin Loss Shield • Customer Excel & PDF + GST • Revision Tracker • {cloud_badge}</p>
+        <p>Alias Memory • Margin Loss Shield • Branded Logo Excel & PDF + GST • Rev-vs-Rev Comparison • {cloud_badge}</p>
     </div>
     """,
     unsafe_allow_html=True,
@@ -1265,8 +1686,8 @@ tab_quote, tab_master, tab_alias, tab_history, tab_cloud = st.tabs(
         "🚀 Generate Quotation",
         f"🗄️ Mastersheet ({len(master_df)})",
         f"🧠 Alias Memory ({len(alias_df)})",
-        f"📜 Quotation History ({len(history_list)})",
-        "☁️ Cloud Sync (Google Sheets)",
+        f"📜 History & Compare ({len(history_list)})",
+        "☁️ Cloud Sync & Secrets",
     ]
 )
 
@@ -1378,9 +1799,7 @@ with tab_quote:
                             else {}
                         )
 
-                        exact_rows = []
-                        alias_rows = []
-                        unmatched_rows = []
+                        exact_rows, alias_rows, unmatched_rows = [], [], []
 
                         for idx, row in bom_combined.iterrows():
                             k = strict_alnum_key(row["sub_material"])
@@ -1523,10 +1942,7 @@ with tab_quote:
                                             unsafe_allow_html=True,
                                         )
                                     else:
-                                        st.markdown(
-                                            '<div class="safe-badge">✅ All numbers & sizes match</div>',
-                                            unsafe_allow_html=True,
-                                        )
+                                        st.markdown('<div class="safe-badge">✅ All numbers & sizes match</div>', unsafe_allow_html=True)
 
                                     with st.expander("➕ Not in Mastersheet? Add this exact BOM item to Mastersheet"):
                                         ac1, ac2, ac3, ac4 = st.columns([2, 1, 1, 1.2])
@@ -1581,11 +1997,30 @@ with tab_quote:
                         all_included = exact_rows + alias_rows + approved_close_rows
 
         # ============================================================
-        # COMMERCIAL SETTINGS, MARGIN ALERTS, REVISION SAVE & EXPORTS
+        # COMMERCIAL SETTINGS, LOGO UPLOAD, MARGIN ALERTS & EXPORTS
         # ============================================================
         if all_included:
             st.divider()
-            st.subheader("🏢 Commercial Cover Details & Pricing Parameters")
+            st.subheader("🏢 Commercial Cover Details, Company Logo & Pricing")
+
+            # Company Logo Uploader Bar
+            with st.expander("🖼️ Company Logo Branding (Embedded on Customer Excel Cover Sheet & PDF)", expanded=(logo_bytes is None)):
+                lc1, lc2, lc3 = st.columns([2.2, 1.5, 1.0])
+                with lc1:
+                    up_logo = st.file_uploader("Upload Company Logo (PNG / JPG)", type=["png", "jpg", "jpeg"], key="logo_uploader")
+                    if up_logo is not None:
+                        logo_bytes = save_logo_bytes(up_logo.getvalue())
+                        st.success("✅ Logo saved! It will appear on your Customer Excel & PDF offers.")
+                with lc2:
+                    if logo_bytes:
+                        st.image(logo_bytes, caption="Active Logo Preview", width=180)
+                    else:
+                        st.caption("No logo uploaded yet. Exports will use a clean text banner.")
+                with lc3:
+                    if logo_bytes and st.button("🗑️ Remove Logo"):
+                        clear_logo()
+                        logo_bytes = None
+                        st.rerun()
 
             c_m1, c_m2, c_m3, c_m4 = st.columns([1.4, 1.2, 0.8, 1.0])
             with c_m1:
@@ -1655,7 +2090,6 @@ with tab_quote:
                 st.error(
                     f"🚨 **NEGATIVE MARGIN ALERT:** **{summary['loss_item_count']} item(s)** are selling **BELOW Purchase Cost** "
                     f"(combined loss on those items: **₹{summary['loss_total_amount']:,.2f}**). "
-                    f"When Discount % outweighs Profit % (e.g., `12%` profit with `35%` discount = selling at `72.8%` of purchase cost), the line loses money. "
                     f"Check the red rows below or adjust Discount / Profit %."
                 )
 
@@ -1743,7 +2177,7 @@ with tab_quote:
 
             st.markdown("### 📥 Download Quotations")
             internal_xl = build_internal_quotation_excel(calc_df, quote_meta, summary, profit_pct, default_make, audit_df)
-            customer_xl = build_customer_quotation_excel(calc_df, quote_meta, summary, default_make)
+            customer_xl = build_customer_quotation_excel(calc_df, quote_meta, summary, default_make, logo_bytes=logo_bytes)
 
             d1, d2, d3 = st.columns(3)
             with d1:
@@ -1757,7 +2191,7 @@ with tab_quote:
                 )
             with d2:
                 st.download_button(
-                    label="⬇️ Customer Excel (No Purchase/Profit)",
+                    label="⬇️ Customer Excel (Branded + GST)",
                     data=customer_xl,
                     file_name=f"quotation_{quote_meta['annexure_no']}_Rev{int(revision_no)}_CUSTOMER.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -1765,16 +2199,16 @@ with tab_quote:
                 )
             with d3:
                 if HAS_FPDF:
-                    customer_pdf = build_customer_pdf(calc_df, quote_meta, summary, default_make)
+                    customer_pdf = build_customer_pdf(calc_df, quote_meta, summary, default_make, logo_bytes=logo_bytes)
                     st.download_button(
-                        label="⬇️ Customer PDF Offer (Incl. GST)",
+                        label="⬇️ Customer PDF Offer (Branded + GST)",
                         data=customer_pdf,
                         file_name=f"quotation_{quote_meta['annexure_no']}_Rev{int(revision_no)}_CUSTOMER.pdf",
                         mime="application/pdf",
                         use_container_width=True,
                     )
                 else:
-                    st.info("Run `pip install fpdf2` to enable 1-click Customer PDF export.")
+                    st.info("Run `pip install fpdf2` to enable Customer PDF export.")
 
 
 # ============================================================
@@ -1874,13 +2308,10 @@ with tab_master:
 # ============================================================
 with tab_alias:
     st.subheader("🧠 Auto-Learning Alias Memory")
-    st.caption(
-        "Whenever you approve close matches in Tab 1 and click **Remember Approved Matches**, they are saved here. "
-        "Future BOMs containing those names will auto-match using your **live Mastersheet price & discount**."
-    )
+    st.caption("Learned mappings auto-match future BOMs using your live Mastersheet rates.")
 
     if alias_df.empty:
-        st.info("No learned aliases saved yet. Approve close matches in **Generate Quotation** and click **Remember Approved Matches** to build memory.")
+        st.info("No learned aliases saved yet. Approve close matches in **Generate Quotation** and click **Remember Approved Matches** to start building memory.")
     else:
         edited_alias = st.data_editor(
             alias_df[["bom_sample_name", "master_sub_material", "created_at"]],
@@ -1904,151 +2335,202 @@ with tab_alias:
                 st.success("✅ Alias Memory updated!")
                 st.rerun()
         with a2:
-            st.download_button(
-                "⬇️ Export Alias Memory CSV",
-                data=alias_df.to_csv(index=False).encode("utf-8-sig"),
-                file_name="alias_memory.csv",
-                mime="text/csv",
-            )
+            st.download_button("⬇️ Export Alias Memory CSV", data=alias_df.to_csv(index=False).encode("utf-8-sig"), file_name="alias_memory.csv", mime="text/csv")
 
 
 # ============================================================
-# TAB 4: QUOTATION HISTORY & REVISION TRACKER
+# TAB 4: QUOTATION HISTORY & REV-VS-REV COMPARISON VIEW
 # ============================================================
 with tab_history:
-    st.subheader("📜 Quotation History & Revision Tracker")
+    st.subheader("📜 Quotation History, Revisions & Side-by-Side Comparison")
     if not history_list:
-        st.info("No quotations saved yet. After generating a quotation in Tab 1, click **Save to Quotation History** to store revisions here.")
+        st.info("No quotations saved yet. Generate a quotation in Tab 1 and click **Save to Quotation History**.")
     else:
-        h_search = st.text_input("🔎 Filter by Annexure/Job No, Customer, or Project:")
-        filtered_hist = [
-            h for h in history_list
-            if not h_search.strip()
-            or h_search.lower() in str(h.get("annexure_no", "")).lower()
-            or h_search.lower() in str(h.get("customer", "")).lower()
-            or h_search.lower() in str(h.get("project", "")).lower()
-        ]
+        sub_hist, sub_comp = st.tabs(["📂 Saved Revisions", "⚖️ Compare Two Revisions (Rev A vs Rev B)"])
 
-        summary_table = pd.DataFrame(
-            [
-                {
-                    "Annexure / Job": h.get("annexure_no", ""),
-                    "Revision": f"Rev {h.get('revision', 0)}",
-                    "Saved On": h.get("created_at", ""),
-                    "Customer": h.get("customer", ""),
-                    "Project": h.get("project", ""),
-                    "Items": h.get("item_count", len(h.get("items", []))),
-                    "Basic Total (₹)": round(float(h.get("basic_total", 0.0)), 2),
-                    "Grand Total Incl. GST (₹)": round(float(h.get("grand_total", 0.0)), 2),
+        # --- SUB-TAB A: SAVED REVISIONS ---
+        with sub_hist:
+            h_search = st.text_input("🔎 Filter by Annexure/Job No, Customer, or Project:")
+            filtered_hist = [
+                h for h in history_list
+                if not h_search.strip()
+                or h_search.lower() in str(h.get("annexure_no", "")).lower()
+                or h_search.lower() in str(h.get("customer", "")).lower()
+                or h_search.lower() in str(h.get("project", "")).lower()
+            ]
+
+            summary_table = pd.DataFrame(
+                [
+                    {
+                        "Annexure / Job": h.get("annexure_no", ""),
+                        "Revision": f"Rev {h.get('revision', 0)}",
+                        "Saved On": h.get("created_at", ""),
+                        "Customer": h.get("customer", ""),
+                        "Project": h.get("project", ""),
+                        "Items": h.get("item_count", len(h.get("items", []))),
+                        "Basic Total (₹)": round(float(h.get("basic_total", 0.0)), 2),
+                        "Grand Total Incl. GST (₹)": round(float(h.get("grand_total", 0.0)), 2),
+                    }
+                    for h in filtered_hist
+                ]
+            )
+            st.dataframe(summary_table, use_container_width=True, hide_index=True)
+
+            if filtered_hist:
+                h_labels = [
+                    f"Annexure {h['annexure_no']} (Rev {h['revision']}) — {h.get('customer', 'N/A')} | ₹{float(h.get('grand_total', 0)):,.2f} [{h.get('created_at', '')}]"
+                    for h in filtered_hist
+                ]
+                sel_h_idx = st.selectbox("Select Saved Quotation:", options=range(len(h_labels)), format_func=lambda i: h_labels[i])
+                chosen_h = filtered_hist[sel_h_idx]
+
+                h_items_df = pd.DataFrame(chosen_h.get("items", []))
+                h_calc, h_sum = compute_commercials(h_items_df, float(chosen_h.get("profit_pct", 12)), float(chosen_h.get("pf_pct", 0)), float(chosen_h.get("gst_pct", 18)))
+                h_meta = {
+                    "company_name": chosen_h.get("company_name", "Quotation"),
+                    "annexure_no": chosen_h.get("annexure_no", ""),
+                    "revision": chosen_h.get("revision", 0),
+                    "quote_date": chosen_h.get("quote_date", ""),
+                    "customer": chosen_h.get("customer", ""),
+                    "project": chosen_h.get("project", ""),
+                    "location": chosen_h.get("location", ""),
+                    "terms": chosen_h.get("terms", DEFAULT_TERMS),
                 }
-                for h in filtered_hist
-            ]
-        )
-        st.dataframe(summary_table, use_container_width=True, hide_index=True)
 
-        st.markdown("#### Reopen, Revise, or Re-Download a Saved Quotation")
-        if filtered_hist:
-            h_labels = [
-                f"Annexure {h['annexure_no']} (Rev {h['revision']}) — {h.get('customer', 'N/A')} | ₹{float(h.get('grand_total', 0)):,.2f} [{h.get('created_at', '')}]"
-                for h in filtered_hist
-            ]
-            sel_h_idx = st.selectbox("Select Saved Quotation:", options=range(len(h_labels)), format_func=lambda i: h_labels[i])
-            chosen_h = filtered_hist[sel_h_idx]
-
-            h_items_df = pd.DataFrame(chosen_h.get("items", []))
-            h_calc, h_sum = compute_commercials(h_items_df, float(chosen_h.get("profit_pct", 12)), float(chosen_h.get("pf_pct", 0)), float(chosen_h.get("gst_pct", 18)))
-            h_meta = {
-                "company_name": chosen_h.get("company_name", "Quotation"),
-                "annexure_no": chosen_h.get("annexure_no", ""),
-                "revision": chosen_h.get("revision", 0),
-                "quote_date": chosen_h.get("quote_date", ""),
-                "customer": chosen_h.get("customer", ""),
-                "project": chosen_h.get("project", ""),
-                "location": chosen_h.get("location", ""),
-                "terms": chosen_h.get("terms", DEFAULT_TERMS),
-            }
-
-            hc1, hc2, hc3, hc4, hc5 = st.columns(5)
-            with hc1:
-                if st.button("📂 Load to Revise", type="primary", use_container_width=True):
-                    st.session_state["loaded_history_quote"] = chosen_h
-                    st.success("Loaded! Switch to **🚀 Generate Quotation** to edit & save next Rev.")
-            with hc2:
-                st.download_button(
-                    "⬇️ Internal Excel",
-                    data=build_internal_quotation_excel(h_calc, h_meta, h_sum, float(chosen_h.get("profit_pct", 12)), chosen_h.get("default_make", "Reputed")),
-                    file_name=f"quotation_{h_meta['annexure_no']}_Rev{h_meta['revision']}_INTERNAL.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True,
-                )
-            with hc3:
-                st.download_button(
-                    "⬇️ Customer Excel",
-                    data=build_customer_quotation_excel(h_calc, h_meta, h_sum, chosen_h.get("default_make", "Reputed")),
-                    file_name=f"quotation_{h_meta['annexure_no']}_Rev{h_meta['revision']}_CUSTOMER.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True,
-                )
-            with hc4:
-                if HAS_FPDF:
+                hc1, hc2, hc3, hc4, hc5 = st.columns(5)
+                with hc1:
+                    if st.button("📂 Load to Revise", type="primary", use_container_width=True):
+                        st.session_state["loaded_history_quote"] = chosen_h
+                        st.success("Loaded! Switch to **🚀 Generate Quotation** to edit & save next Rev.")
+                with hc2:
                     st.download_button(
-                        "⬇️ Customer PDF",
-                        data=build_customer_pdf(h_calc, h_meta, h_sum, chosen_h.get("default_make", "Reputed")),
-                        file_name=f"quotation_{h_meta['annexure_no']}_Rev{h_meta['revision']}_CUSTOMER.pdf",
-                        mime="application/pdf",
+                        "⬇️ Internal Excel",
+                        data=build_internal_quotation_excel(h_calc, h_meta, h_sum, float(chosen_h.get("profit_pct", 12)), chosen_h.get("default_make", "Reputed")),
+                        file_name=f"quotation_{h_meta['annexure_no']}_Rev{h_meta['revision']}_INTERNAL.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                         use_container_width=True,
                     )
-            with hc5:
-                if st.button("🗑️ Delete", use_container_width=True):
-                    new_hist = [h for h in history_list if h.get("id") != chosen_h.get("id")]
-                    save_history(new_hist)
-                    st.success("Deleted snapshot.")
-                    st.rerun()
+                with hc3:
+                    st.download_button(
+                        "⬇️ Customer Excel",
+                        data=build_customer_quotation_excel(h_calc, h_meta, h_sum, chosen_h.get("default_make", "Reputed"), logo_bytes=logo_bytes),
+                        file_name=f"quotation_{h_meta['annexure_no']}_Rev{h_meta['revision']}_CUSTOMER.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True,
+                    )
+                with hc4:
+                    if HAS_FPDF:
+                        st.download_button(
+                            "⬇️ Customer PDF",
+                            data=build_customer_pdf(h_calc, h_meta, h_sum, chosen_h.get("default_make", "Reputed"), logo_bytes=logo_bytes),
+                            file_name=f"quotation_{h_meta['annexure_no']}_Rev{h_meta['revision']}_CUSTOMER.pdf",
+                            mime="application/pdf",
+                            use_container_width=True,
+                        )
+                with hc5:
+                    if st.button("🗑️ Delete", use_container_width=True):
+                        new_hist = [h for h in history_list if h.get("id") != chosen_h.get("id")]
+                        save_history(new_hist)
+                        st.success("Deleted snapshot.")
+                        st.rerun()
+
+        # --- SUB-TAB B: SIDE-BY-SIDE REVISION COMPARISON ---
+        with sub_comp:
+            if len(history_list) < 2:
+                st.info("Save at least **2 quotations / revisions** (e.g., `Rev 0` and `Rev 1`) in History to compare them side-by-side.")
+            else:
+                comp_labels = [
+                    f"Annexure {h['annexure_no']} (Rev {h['revision']}) — {h.get('customer', 'N/A')} | ₹{float(h.get('grand_total', 0)):,.2f} [{h.get('created_at', '')}]"
+                    for h in history_list
+                ]
+                cc1, cc2 = st.columns(2)
+                with cc1:
+                    idx_a = st.selectbox("Baseline Revision (Old / Rev A):", options=range(len(comp_labels)), index=min(1, len(comp_labels) - 1), format_func=lambda i: comp_labels[i], key="comp_rev_a")
+                with cc2:
+                    idx_b = st.selectbox("Revised Quote (New / Rev B):", options=range(len(comp_labels)), index=0, format_func=lambda i: comp_labels[i], key="comp_rev_b")
+
+                diff_df, comp_meta = compare_revisions(history_list[idx_a], history_list[idx_b])
+
+                cm1, cm2, cm3, cm4, cm5 = st.columns(5)
+                cm1.metric("Baseline Grand Total", f"₹ {comp_meta['sum_a']['grand_total_incl_gst']:,.2f}")
+                cm2.metric("Revised Grand Total", f"₹ {comp_meta['sum_b']['grand_total_incl_gst']:,.2f}", delta=f"₹ {comp_meta['grand_delta']:+,.2f} ({comp_meta['pct_delta']:+.1f}%)")
+                cm3.metric("🟢 Added Items", comp_meta["counts"]["Added"])
+                cm4.metric("🔴 Removed Items", comp_meta["counts"]["Removed"])
+                cm5.metric("🟡 Modified Items", comp_meta["counts"]["Modified"])
+
+                only_changed = st.checkbox("Show only changed items (hide Unchanged rows)", value=False)
+                display_diff = diff_df[diff_df["Status"] != "Unchanged"] if only_changed else diff_df
+                st.dataframe(display_diff, use_container_width=True, hide_index=True)
+
+                ex1, ex2 = st.columns(2)
+                fname_base = f"Comparison_{history_list[idx_a]['annexure_no']}_Rev{history_list[idx_a]['revision']}_vs_Rev{history_list[idx_b]['revision']}"
+                with ex1:
+                    st.download_button(
+                        "⬇️ Download Comparison Report (Excel .xlsx)",
+                        data=build_comparison_excel(display_diff, comp_meta),
+                        file_name=f"{fname_base}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        type="primary",
+                        use_container_width=True,
+                    )
+                with ex2:
+                    if HAS_FPDF:
+                        st.download_button(
+                            "⬇️ Download Comparison Report (PDF)",
+                            data=build_comparison_pdf(display_diff, comp_meta, logo_bytes=logo_bytes),
+                            file_name=f"{fname_base}.pdf",
+                            mime="application/pdf",
+                            use_container_width=True,
+                        )
 
 
 # ============================================================
-# TAB 5: LIVE GOOGLE SHEETS CLOUD SYNC (100% FREE)
+# TAB 5: CLOUD SYNC & 1-CLICK STREAMLIT SECRETS TOML GENERATOR
 # ============================================================
 with tab_cloud:
-    st.subheader("☁️ Live Google Sheets Backend (Optional Free Multi-User Sync)")
-    st.markdown(
-        """
-        Sync your **Mastersheet**, **Alias Memory**, and **Quotation History** live with a free Google Sheet so your team shares one central database.
-        
-        **Quick 3-Minute Free Setup:**
-        1. Go to [console.cloud.google.com](https://console.cloud.google.com) → Create a free project → Enable **Google Sheets API** & **Google Drive API**.
-        2. Go to **IAM & Admin → Service Accounts** → Create a Service Account → Keys → **Add Key → Create new key (JSON)**.
-        3. Create a blank Google Sheet → Click **Share** → Add the `client_email` from that JSON file as **Editor**.
-        4. Paste your Google Sheet URL and upload that JSON file below.
-        """
-    )
+    st.subheader("☁️ Live Google Sheets Sync & Streamlit Cloud Secrets Helper")
 
     if not HAS_GSPREAD:
         st.warning("Install Google Sheets libraries first: `pip install gspread google-auth`")
 
     cfg = load_cloud_config()
     if cfg.get("source") == "streamlit_secrets":
-        st.success("✅ Connected via Streamlit Cloud Secrets (`st.secrets`).")
+        st.success("✅ **Active on Streamlit Cloud:** Connected securely via `st.secrets` (Google Sheets Auto-Sync is ON).")
     else:
-        gs_url = st.text_input("Google Sheet URL", value=cfg.get("gsheet_url", ""), placeholder="https://docs.google.com/spreadsheets/d/...")
-        sa_file = st.file_uploader("Upload Google Service Account JSON Key", type=["json"])
-        auto_sync_chk = st.checkbox("Auto-push changes to Google Sheets on every Save", value=bool(cfg.get("auto_sync", False)))
+        st.markdown("#### Step 1: Connect Your Google Sheet")
+        gs_url = st.text_input("Google Sheet URL", value=cfg.get("gsheet_url", ""), placeholder="https://docs.google.com/spreadsheets/d/.../edit")
+        sa_file = st.file_uploader("Upload Google Service Account JSON Key", type=["json"], key="sa_uploader")
+        auto_sync_chk = st.checkbox("Auto-push changes to Google Sheets on every Save (Local PC)", value=bool(cfg.get("auto_sync", False)))
 
         sa_data = cfg.get("service_account")
         if sa_file is not None:
             try:
                 sa_data = json.load(sa_file)
-                st.info(f"Loaded credentials for: `{sa_data.get('client_email', 'service-account')}`")
+                st.success(f"✅ JSON Key Loaded! Share your Google Sheet as **Editor** with: `{sa_data.get('client_email', '')}`")
             except Exception as e:
                 st.error(f"Invalid JSON file: {e}")
 
-        if st.button("💾 Save Cloud Connection Settings", type="primary"):
-            if not gs_url.strip() or not sa_data:
-                st.error("Please provide both the Google Sheet URL and Service Account JSON key.")
-            else:
-                save_cloud_config({"enabled": True, "auto_sync": auto_sync_chk, "gsheet_url": gs_url.strip(), "service_account": sa_data})
-                st.success("✅ Cloud settings saved!")
-                st.rerun()
+        c_save, c_toml = st.columns(2)
+        with c_save:
+            if st.button("💾 Save Connection Locally", type="primary", use_container_width=True):
+                if not gs_url.strip() or not sa_data:
+                    st.error("Please provide both the Google Sheet URL and Service Account JSON key.")
+                else:
+                    save_cloud_config({"enabled": True, "auto_sync": auto_sync_chk, "gsheet_url": gs_url.strip(), "service_account": sa_data})
+                    st.success("✅ Saved locally! You can now Push/Pull below.")
+                    st.rerun()
+
+        with c_toml:
+            if st.button("🛠️ Generate Streamlit Cloud Secrets TOML", use_container_width=True):
+                if not gs_url.strip() or not sa_data:
+                    st.error("Paste your Google Sheet URL and upload your JSON key first.")
+                else:
+                    st.session_state["generated_toml"] = generate_streamlit_toml(gs_url.strip(), sa_data)
+
+        if st.session_state.get("generated_toml"):
+            st.markdown("#### 📋 Copy & Paste Into Streamlit Cloud (`App Settings → Secrets`)")
+            st.caption("Click the copy icon in the top-right corner of the box below, then paste directly into Streamlit Community Cloud → Settings → Secrets → Save.")
+            st.code(st.session_state["generated_toml"], language="toml")
 
     st.divider()
     st.markdown("#### Manual Sync Controls")
