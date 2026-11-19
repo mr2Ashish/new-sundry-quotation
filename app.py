@@ -329,7 +329,7 @@ def get_or_create_worksheet(sh, title: str, headers: list):
         ws = sh.worksheet(title)
     except Exception:
         ws = sh.add_worksheet(title=title, rows=500, cols=max(10, len(headers)))
-        ws.update("A1", [headers])
+        ws.update(values=[headers], range_name="A1")
     return ws
 
 
@@ -338,7 +338,7 @@ def push_df_to_gsheet(df: pd.DataFrame, tab_name: str, cfg: dict):
     ws = get_or_create_worksheet(sh, tab_name, list(df.columns))
     ws.clear()
     rows = [list(df.columns)] + df.fillna("").astype(str).values.tolist()
-    ws.update("A1", rows)
+    ws.update(values=rows, range_name="A1")
 
 
 def pull_df_from_gsheet(tab_name: str, expected_cols: list, cfg: dict) -> pd.DataFrame:
@@ -1355,10 +1355,31 @@ def build_customer_quotation_excel(
 
 
 # ============================================================
-# EXPORT 3: CUSTOMER-FACING PDF (WITH COMPANY LOGO)
+# EXPORT 3: CUSTOMER-FACING PDF (fpdf2 2.9+ SAFE, NO CRASH)
 # ============================================================
 def safe_pdf_text(text: str) -> str:
     return str(text).replace("₹", "Rs.").encode("latin-1", "replace").decode("latin-1")
+
+
+def _pdf_cell(pdf: FPDF, w: float, h: float, txt: str = "", border=0, align: str = "L", fill: bool = False, new_line: bool = False):
+    if new_line:
+        if IS_FPDF2:
+            pdf.cell(w, h, txt, border=border, align=align, fill=fill, new_x="LMARGIN", new_y="NEXT")
+        else:
+            pdf.cell(w, h, txt, border=border, align=align, fill=fill, ln=1)
+    else:
+        pdf.cell(w, h, txt, border=border, align=align, fill=fill)
+
+
+def _pdf_multi_line(pdf: FPDF, h: float, txt: str):
+    """Always resets cursor to left margin and passes explicit printable width (prevents FPDFException)."""
+    pdf.set_x(pdf.l_margin)
+    usable_w = pdf.w - pdf.l_margin - pdf.r_margin
+    if IS_FPDF2:
+        pdf.multi_cell(usable_w, h, txt, new_x="LMARGIN", new_y="NEXT")
+    else:
+        pdf.multi_cell(usable_w, h, txt)
+    pdf.set_x(pdf.l_margin)
 
 
 def _pdf_add_logo_header(pdf: FPDF, title_text: str, logo_bytes: bytes = None):
@@ -1373,8 +1394,9 @@ def _pdf_add_logo_header(pdf: FPDF, title_text: str, logo_bytes: bytes = None):
             pdf.set_fill_color(31, 78, 120)
             pdf.set_text_color(255, 255, 255)
             pdf.set_font("Helvetica", "B", 12)
-            pdf.cell(0, 14, safe_pdf_text(title_text), ln=1, align="C", fill=True)
+            _pdf_cell(pdf, 0, 14, safe_pdf_text(title_text), align="C", fill=True, new_line=True)
             pdf.ln(3)
+            pdf.set_x(pdf.l_margin)
             return
         except Exception:
             pass
@@ -1385,11 +1407,13 @@ def _pdf_add_logo_header(pdf: FPDF, title_text: str, logo_bytes: bytes = None):
                 except Exception:
                     pass
 
+    pdf.set_x(pdf.l_margin)
     pdf.set_fill_color(31, 78, 120)
     pdf.set_text_color(255, 255, 255)
     pdf.set_font("Helvetica", "B", 13)
-    pdf.cell(0, 12, safe_pdf_text(title_text), ln=1, align="C", fill=True)
+    _pdf_cell(pdf, 0, 12, safe_pdf_text(title_text), align="C", fill=True, new_line=True)
     pdf.ln(3)
+    pdf.set_x(pdf.l_margin)
 
 
 def build_customer_pdf(final_df: pd.DataFrame, meta: dict, summary: dict, default_make: str, logo_bytes: bytes = None) -> io.BytesIO:
@@ -1401,27 +1425,27 @@ def build_customer_pdf(final_df: pd.DataFrame, meta: dict, summary: dict, defaul
 
     pdf.set_text_color(0, 0, 0)
     pdf.set_font("Helvetica", "B", 9)
-    pdf.cell(32, 6, "Quotation Ref:", border=1)
+    _pdf_cell(pdf, 32, 6, "Quotation Ref:", border=1)
     pdf.set_font("Helvetica", "", 9)
-    pdf.cell(68, 6, safe_pdf_text(f"QTN-{meta['annexure_no']}-Rev{meta['revision']}"), border=1)
+    _pdf_cell(pdf, 68, 6, safe_pdf_text(f"QTN-{meta['annexure_no']}-Rev{meta['revision']}"), border=1)
     pdf.set_font("Helvetica", "B", 9)
-    pdf.cell(25, 6, "Date:", border=1)
+    _pdf_cell(pdf, 25, 6, "Date:", border=1)
     pdf.set_font("Helvetica", "", 9)
-    pdf.cell(0, 6, safe_pdf_text(meta["quote_date"]), border=1, ln=1)
+    _pdf_cell(pdf, 0, 6, safe_pdf_text(meta["quote_date"]), border=1, new_line=True)
 
     pdf.set_font("Helvetica", "B", 9)
-    pdf.cell(32, 6, "Customer:", border=1)
+    _pdf_cell(pdf, 32, 6, "Customer:", border=1)
     pdf.set_font("Helvetica", "", 9)
-    pdf.cell(68, 6, safe_pdf_text(meta.get("customer", "-")[:40]), border=1)
+    _pdf_cell(pdf, 68, 6, safe_pdf_text(meta.get("customer", "-")[:40]), border=1)
     pdf.set_font("Helvetica", "B", 9)
-    pdf.cell(25, 6, "Location:", border=1)
+    _pdf_cell(pdf, 25, 6, "Location:", border=1)
     pdf.set_font("Helvetica", "", 9)
-    pdf.cell(0, 6, safe_pdf_text(meta.get("location", "-")[:30]), border=1, ln=1)
+    _pdf_cell(pdf, 0, 6, safe_pdf_text(meta.get("location", "-")[:30]), border=1, new_line=True)
 
     pdf.set_font("Helvetica", "B", 9)
-    pdf.cell(32, 6, "Project:", border=1)
+    _pdf_cell(pdf, 32, 6, "Project:", border=1)
     pdf.set_font("Helvetica", "", 9)
-    pdf.cell(0, 6, safe_pdf_text(meta.get("project", "-")[:95]), border=1, ln=1)
+    _pdf_cell(pdf, 0, 6, safe_pdf_text(meta.get("project", "-")[:95]), border=1, new_line=True)
     pdf.ln(4)
 
     widths = [10, 86, 18, 14, 20, 14, 28]
@@ -1430,28 +1454,27 @@ def build_customer_pdf(final_df: pd.DataFrame, meta: dict, summary: dict, defaul
     pdf.set_text_color(255, 255, 255)
     pdf.set_font("Helvetica", "B", 8)
     for w, h in zip(widths, headers):
-        pdf.cell(w, 7, h, border=1, align="C", fill=True)
+        _pdf_cell(pdf, w, 7, h, border=1, align="C", fill=True)
     pdf.ln()
 
     pdf.set_text_color(0, 0, 0)
     for cat_name, grp in final_df.groupby("main_material", sort=False):
         pdf.set_fill_color(217, 225, 242)
         pdf.set_font("Helvetica", "B", 8)
-        pdf.cell(sum(widths), 6, safe_pdf_text(cat_name), border=1, ln=1, fill=True)
+        _pdf_cell(pdf, sum(widths), 6, safe_pdf_text(cat_name), border=1, fill=True, new_line=True)
 
         pdf.set_font("Helvetica", "", 7.5)
         for sr_no, (_, item) in enumerate(grp.iterrows(), start=1):
             desc = safe_pdf_text(item["sub_material"])
             if len(desc) > 72:
                 desc = desc[:69] + "..."
-            pdf.cell(widths[0], 6, str(sr_no), border=1, align="C")
-            pdf.cell(widths[1], 6, desc, border=1, align="L")
-            pdf.cell(widths[2], 6, safe_pdf_text(default_make[:11]), border=1, align="C")
-            pdf.cell(widths[3], 6, f"{item['qty']:g}", border=1, align="R")
-            pdf.cell(widths[4], 6, f"{item['Amnt']:,.2f}", border=1, align="R")
-            pdf.cell(widths[5], 6, f"{item['discount']:g}", border=1, align="R")
-            pdf.cell(widths[6], 6, f"{item['Total Amnt']:,.2f}", border=1, align="R")
-            pdf.ln()
+            _pdf_cell(pdf, widths[0], 6, str(sr_no), border=1, align="C")
+            _pdf_cell(pdf, widths[1], 6, desc, border=1, align="L")
+            _pdf_cell(pdf, widths[2], 6, safe_pdf_text(default_make[:11]), border=1, align="C")
+            _pdf_cell(pdf, widths[3], 6, f"{item['qty']:g}", border=1, align="R")
+            _pdf_cell(pdf, widths[4], 6, f"{item['Amnt']:,.2f}", border=1, align="R")
+            _pdf_cell(pdf, widths[5], 6, f"{item['discount']:g}", border=1, align="R")
+            _pdf_cell(pdf, widths[6], 6, f"{item['Total Amnt']:,.2f}", border=1, align="R", new_line=True)
 
     pdf.ln(3)
     sum_rows = [
@@ -1465,16 +1488,17 @@ def build_customer_pdf(final_df: pd.DataFrame, meta: dict, summary: dict, defaul
         pdf.set_font("Helvetica", "B" if is_bold else "", 9)
         if idx_s == 4:
             pdf.set_fill_color(226, 239, 218)
-        pdf.cell(130, 6.5, safe_pdf_text(lbl), border=1, align="R", fill=(idx_s == 4))
-        pdf.cell(60, 6.5, safe_pdf_text(val), border=1, align="R", fill=(idx_s == 4), ln=1)
+        _pdf_cell(pdf, 130, 6.5, safe_pdf_text(lbl), border=1, align="R", fill=(idx_s == 4))
+        _pdf_cell(pdf, 60, 6.5, safe_pdf_text(val), border=1, align="R", fill=(idx_s == 4), new_line=True)
 
     pdf.ln(4)
+    pdf.set_x(pdf.l_margin)
     pdf.set_font("Helvetica", "B", 9)
-    pdf.cell(0, 6, "Terms & Conditions:", ln=1)
+    _pdf_cell(pdf, 0, 6, "Terms & Conditions:", new_line=True)
     pdf.set_font("Helvetica", "", 8)
     for line in str(meta.get("terms", DEFAULT_TERMS)).splitlines():
         if line.strip():
-            pdf.multi_cell(0, 4.5, safe_pdf_text(line.strip()))
+            _pdf_multi_line(pdf, 4.5, safe_pdf_text(line.strip()))
 
     raw_pdf = pdf.output() if IS_FPDF2 else pdf.output(dest="S")
     pdf_bytes = raw_pdf.encode("latin-1") if isinstance(raw_pdf, str) else bytes(raw_pdf)
@@ -1595,8 +1619,9 @@ def build_comparison_pdf(diff_df: pd.DataFrame, comp_meta: dict, logo_bytes: byt
 
     pdf.set_text_color(0, 0, 0)
     pdf.set_font("Helvetica", "B", 8.5)
-    pdf.cell(135, 6, safe_pdf_text(f"Customer: {comp_meta['customer']} | Project: {comp_meta['project'][:50]}"), border=1)
-    pdf.cell(
+    _pdf_cell(pdf, 135, 6, safe_pdf_text(f"Customer: {comp_meta['customer']} | Project: {comp_meta['project'][:50]}"), border=1)
+    _pdf_cell(
+        pdf,
         0,
         6,
         safe_pdf_text(
@@ -1604,7 +1629,7 @@ def build_comparison_pdf(diff_df: pd.DataFrame, comp_meta: dict, logo_bytes: byt
             f"+{comp_meta['counts']['Added']} Add / -{comp_meta['counts']['Removed']} Rem / {comp_meta['counts']['Modified']} Mod"
         ),
         border=1,
-        ln=1,
+        new_line=True,
     )
     pdf.ln(3)
 
@@ -1614,7 +1639,7 @@ def build_comparison_pdf(diff_df: pd.DataFrame, comp_meta: dict, logo_bytes: byt
     pdf.set_text_color(255, 255, 255)
     pdf.set_font("Helvetica", "B", 7.5)
     for w, h in zip(widths, headers):
-        pdf.cell(w, 7, h, border=1, align="C", fill=True)
+        _pdf_cell(pdf, w, 7, h, border=1, align="C", fill=True)
     pdf.ln()
 
     pdf.set_text_color(0, 0, 0)
@@ -1640,16 +1665,15 @@ def build_comparison_pdf(diff_df: pd.DataFrame, comp_meta: dict, logo_bytes: byt
         if len(note) > 28:
             note = note[:25] + "..."
 
-        pdf.cell(widths[0], 5.5, st_val, border=1, align="C", fill=fill)
-        pdf.cell(widths[1], 5.5, desc, border=1, align="L", fill=fill)
-        pdf.cell(widths[2], 5.5, f"{r['Old QTY']:g}", border=1, align="R", fill=fill)
-        pdf.cell(widths[3], 5.5, f"{r['New QTY']:g}", border=1, align="R", fill=fill)
-        pdf.cell(widths[4], 5.5, f"{r['Old Net Rate']:,.2f}", border=1, align="R", fill=fill)
-        pdf.cell(widths[5], 5.5, f"{r['New Net Rate']:,.2f}", border=1, align="R", fill=fill)
-        pdf.cell(widths[6], 5.5, f"{r['Old Total']:,.2f}", border=1, align="R", fill=fill)
-        pdf.cell(widths[7], 5.5, f"{r['New Total']:,.2f}", border=1, align="R", fill=fill)
-        pdf.cell(widths[8], 5.5, note, border=1, align="L", fill=fill)
-        pdf.ln()
+        _pdf_cell(pdf, widths[0], 5.5, st_val, border=1, align="C", fill=fill)
+        _pdf_cell(pdf, widths[1], 5.5, desc, border=1, align="L", fill=fill)
+        _pdf_cell(pdf, widths[2], 5.5, f"{r['Old QTY']:g}", border=1, align="R", fill=fill)
+        _pdf_cell(pdf, widths[3], 5.5, f"{r['New QTY']:g}", border=1, align="R", fill=fill)
+        _pdf_cell(pdf, widths[4], 5.5, f"{r['Old Net Rate']:,.2f}", border=1, align="R", fill=fill)
+        _pdf_cell(pdf, widths[5], 5.5, f"{r['New Net Rate']:,.2f}", border=1, align="R", fill=fill)
+        _pdf_cell(pdf, widths[6], 5.5, f"{r['Old Total']:,.2f}", border=1, align="R", fill=fill)
+        _pdf_cell(pdf, widths[7], 5.5, f"{r['New Total']:,.2f}", border=1, align="R", fill=fill)
+        _pdf_cell(pdf, widths[8], 5.5, note, border=1, align="L", fill=fill, new_line=True)
 
     raw_pdf = pdf.output() if IS_FPDF2 else pdf.output(dest="S")
     pdf_bytes = raw_pdf.encode("latin-1") if isinstance(raw_pdf, str) else bytes(raw_pdf)
@@ -2071,7 +2095,7 @@ with tab_quote:
 
             edited_items = st.data_editor(
                 base_df[["main_material", "sub_material", "qty", "purchase_price", "discount"]],
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
                 disabled=["main_material", "sub_material"],
                 column_config={
@@ -2105,11 +2129,11 @@ with tab_quote:
 
             with st.expander("🔎 View Full Profit/Loss Margin Breakdown per Item", expanded=(summary["loss_item_count"] > 0)):
                 view_cols = ["Loss Alert", "main_material", "sub_material", "qty", "purchase_price", "Amnt", "discount", "Net Unit Rate", "Total Amnt", "Net Profit", "Margin %"]
-                st.dataframe(calc_df[view_cols], use_container_width=True, hide_index=True)
+                st.dataframe(calc_df[view_cols], width="stretch", hide_index=True)
 
             act1, act2 = st.columns(2)
             with act1:
-                if st.button("💾 Sync Edited Purchase Prices & Discounts Back to Mastersheet", use_container_width=True):
+                if st.button("💾 Sync Edited Purchase Prices & Discounts Back to Mastersheet", width="stretch"):
                     updated_master = master_df.copy()
                     updated_master["_k"] = updated_master["sub_material"].apply(strict_alnum_key)
                     for _, er in edited_items.iterrows():
@@ -2134,7 +2158,7 @@ with tab_quote:
             }
 
             with act2:
-                if st.button(f"📌 Save to Quotation History as Rev {int(revision_no)}", type="primary", use_container_width=True):
+                if st.button(f"📌 Save to Quotation History as Rev {int(revision_no)}", type="primary", width="stretch"):
                     hist = load_history()
                     snapshot = {
                         "id": f"{quote_meta['annexure_no']}_Rev{quote_meta['revision']}_{datetime.now().strftime('%Y%m%d%H%M%S')}",
@@ -2187,7 +2211,7 @@ with tab_quote:
                     file_name=f"quotation_{quote_meta['annexure_no']}_Rev{int(revision_no)}_INTERNAL.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     type="primary",
-                    use_container_width=True,
+                    width="stretch",
                 )
             with d2:
                 st.download_button(
@@ -2195,7 +2219,7 @@ with tab_quote:
                     data=customer_xl,
                     file_name=f"quotation_{quote_meta['annexure_no']}_Rev{int(revision_no)}_CUSTOMER.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True,
+                    width="stretch",
                 )
             with d3:
                 if HAS_FPDF:
@@ -2205,7 +2229,7 @@ with tab_quote:
                         data=customer_pdf,
                         file_name=f"quotation_{quote_meta['annexure_no']}_Rev{int(revision_no)}_CUSTOMER.pdf",
                         mime="application/pdf",
-                        use_container_width=True,
+                        width="stretch",
                     )
                 else:
                     st.info("Run `pip install fpdf2` to enable Customer PDF export.")
@@ -2228,12 +2252,12 @@ with tab_master:
                 | master_df["sub_material"].str.contains(search_q, case=False, na=False)
             )
             st.info(f"Showing {mask.sum()} matching item(s). Clear the search box to edit or delete rows.")
-            st.dataframe(master_df[mask], use_container_width=True, hide_index=True)
+            st.dataframe(master_df[mask], width="stretch", hide_index=True)
         else:
             edited_df = st.data_editor(
                 master_df,
                 num_rows="dynamic",
-                use_container_width=True,
+                width="stretch",
                 key="master_editor",
                 column_config={
                     "main_material": st.column_config.TextColumn("Main Material", required=True),
@@ -2294,13 +2318,13 @@ with tab_master:
         st.divider()
         e1, e2 = st.columns(2)
         with e1:
-            st.download_button("⬇️ Export CSV Backup", data=master_df.to_csv(index=False).encode("utf-8-sig"), file_name="mastersheet_backup.csv", mime="text/csv", use_container_width=True)
+            st.download_button("⬇️ Export CSV Backup", data=master_df.to_csv(index=False).encode("utf-8-sig"), file_name="mastersheet_backup.csv", mime="text/csv", width="stretch")
         with e2:
             xl_buf = io.BytesIO()
             with pd.ExcelWriter(xl_buf, engine="openpyxl") as writer:
                 master_df.to_excel(writer, index=False, sheet_name="Mastersheet")
             xl_buf.seek(0)
-            st.download_button("⬇️ Export Excel Backup", data=xl_buf, file_name="mastersheet_backup.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
+            st.download_button("⬇️ Export Excel Backup", data=xl_buf, file_name="mastersheet_backup.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", width="stretch")
 
 
 # ============================================================
@@ -2316,7 +2340,7 @@ with tab_alias:
         edited_alias = st.data_editor(
             alias_df[["bom_sample_name", "master_sub_material", "created_at"]],
             num_rows="dynamic",
-            use_container_width=True,
+            width="stretch",
             disabled=["created_at"],
             column_config={
                 "bom_sample_name": st.column_config.TextColumn("BOM Item Name", width="large"),
@@ -2374,7 +2398,7 @@ with tab_history:
                     for h in filtered_hist
                 ]
             )
-            st.dataframe(summary_table, use_container_width=True, hide_index=True)
+            st.dataframe(summary_table, width="stretch", hide_index=True)
 
             if filtered_hist:
                 h_labels = [
@@ -2399,7 +2423,7 @@ with tab_history:
 
                 hc1, hc2, hc3, hc4, hc5 = st.columns(5)
                 with hc1:
-                    if st.button("📂 Load to Revise", type="primary", use_container_width=True):
+                    if st.button("📂 Load to Revise", type="primary", width="stretch"):
                         st.session_state["loaded_history_quote"] = chosen_h
                         st.success("Loaded! Switch to **🚀 Generate Quotation** to edit & save next Rev.")
                 with hc2:
@@ -2408,7 +2432,7 @@ with tab_history:
                         data=build_internal_quotation_excel(h_calc, h_meta, h_sum, float(chosen_h.get("profit_pct", 12)), chosen_h.get("default_make", "Reputed")),
                         file_name=f"quotation_{h_meta['annexure_no']}_Rev{h_meta['revision']}_INTERNAL.xlsx",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        use_container_width=True,
+                        width="stretch",
                     )
                 with hc3:
                     st.download_button(
@@ -2416,7 +2440,7 @@ with tab_history:
                         data=build_customer_quotation_excel(h_calc, h_meta, h_sum, chosen_h.get("default_make", "Reputed"), logo_bytes=logo_bytes),
                         file_name=f"quotation_{h_meta['annexure_no']}_Rev{h_meta['revision']}_CUSTOMER.xlsx",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        use_container_width=True,
+                        width="stretch",
                     )
                 with hc4:
                     if HAS_FPDF:
@@ -2425,10 +2449,10 @@ with tab_history:
                             data=build_customer_pdf(h_calc, h_meta, h_sum, chosen_h.get("default_make", "Reputed"), logo_bytes=logo_bytes),
                             file_name=f"quotation_{h_meta['annexure_no']}_Rev{h_meta['revision']}_CUSTOMER.pdf",
                             mime="application/pdf",
-                            use_container_width=True,
+                            width="stretch",
                         )
                 with hc5:
-                    if st.button("🗑️ Delete", use_container_width=True):
+                    if st.button("🗑️ Delete", width="stretch"):
                         new_hist = [h for h in history_list if h.get("id") != chosen_h.get("id")]
                         save_history(new_hist)
                         st.success("Deleted snapshot.")
@@ -2460,7 +2484,7 @@ with tab_history:
 
                 only_changed = st.checkbox("Show only changed items (hide Unchanged rows)", value=False)
                 display_diff = diff_df[diff_df["Status"] != "Unchanged"] if only_changed else diff_df
-                st.dataframe(display_diff, use_container_width=True, hide_index=True)
+                st.dataframe(display_diff, width="stretch", hide_index=True)
 
                 ex1, ex2 = st.columns(2)
                 fname_base = f"Comparison_{history_list[idx_a]['annexure_no']}_Rev{history_list[idx_a]['revision']}_vs_Rev{history_list[idx_b]['revision']}"
@@ -2471,7 +2495,7 @@ with tab_history:
                         file_name=f"{fname_base}.xlsx",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                         type="primary",
-                        use_container_width=True,
+                        width="stretch",
                     )
                 with ex2:
                     if HAS_FPDF:
@@ -2480,7 +2504,7 @@ with tab_history:
                             data=build_comparison_pdf(display_diff, comp_meta, logo_bytes=logo_bytes),
                             file_name=f"{fname_base}.pdf",
                             mime="application/pdf",
-                            use_container_width=True,
+                            width="stretch",
                         )
 
 
@@ -2512,7 +2536,7 @@ with tab_cloud:
 
         c_save, c_toml = st.columns(2)
         with c_save:
-            if st.button("💾 Save Connection Locally", type="primary", use_container_width=True):
+            if st.button("💾 Save Connection Locally", type="primary", width="stretch"):
                 if not gs_url.strip() or not sa_data:
                     st.error("Please provide both the Google Sheet URL and Service Account JSON key.")
                 else:
@@ -2521,7 +2545,7 @@ with tab_cloud:
                     st.rerun()
 
         with c_toml:
-            if st.button("🛠️ Generate Streamlit Cloud Secrets TOML", use_container_width=True):
+            if st.button("🛠️ Generate Streamlit Cloud Secrets TOML", width="stretch"):
                 if not gs_url.strip() or not sa_data:
                     st.error("Paste your Google Sheet URL and upload your JSON key first.")
                 else:
@@ -2536,7 +2560,7 @@ with tab_cloud:
     st.markdown("#### Manual Sync Controls")
     s1, s2, s3 = st.columns(3)
     with s1:
-        if st.button("⬆️ Push Local Data → Google Sheet", use_container_width=True):
+        if st.button("⬆️ Push Local Data → Google Sheet", width="stretch"):
             try:
                 cfg_now = load_cloud_config()
                 push_df_to_gsheet(load_mastersheet(), "Mastersheet", cfg_now)
@@ -2546,7 +2570,7 @@ with tab_cloud:
             except Exception as e:
                 st.error(f"Push failed: {e}")
     with s2:
-        if st.button("⬇️ Pull Google Sheet → Local App", use_container_width=True):
+        if st.button("⬇️ Pull Google Sheet → Local App", width="stretch"):
             try:
                 cfg_now = load_cloud_config()
                 m_cloud = pull_df_from_gsheet("Mastersheet", MASTER_COLS, cfg_now)
@@ -2563,7 +2587,7 @@ with tab_cloud:
             except Exception as e:
                 st.error(f"Pull failed: {e}")
     with s3:
-        if st.button("🔌 Disconnect Cloud (Stay Offline)", use_container_width=True):
+        if st.button("🔌 Disconnect Cloud (Stay Offline)", width="stretch"):
             if os.path.exists(CLOUD_CFG_FILE):
                 os.remove(CLOUD_CFG_FILE)
             st.info("Switched back to local offline mode.")
